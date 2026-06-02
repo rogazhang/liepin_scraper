@@ -1,0 +1,8 @@
+playwright
+sqlalchemy
+psycopg2-binary
+paramiko
+requests
+fastapi
+uvicorn[standard]
+pydantic

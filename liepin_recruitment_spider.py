@@ -379,6 +379,7 @@ class LiepinSpider:
         self.playwright  = playwright
         self.proxy_pool  = proxy_pool
         self.companies   = companies or COMPANIES
+        self.grand_total = 0  # 本次运行累计新增条数
 
         # headless 优先用参数，其次读环境变量，最后默认有头（方便调试）
         if headless is None:
@@ -713,7 +714,8 @@ class LiepinSpider:
         try:
             if _USE_TUNNEL:
                 start_db_tunnel()
-            _init_db(DATABASE_URL)
+            if _Session is None:
+                _init_db(DATABASE_URL)
             self.open_homepage()
 
             grand_total = 0
@@ -728,6 +730,7 @@ class LiepinSpider:
                     print(f"  等待 {wait:.0f}s 后处理下一家...")
                     time.sleep(wait)
 
+            self.grand_total = grand_total
             print(f"\n全部完成，共写入 {grand_total} 条到 competitor_recruitment 表")
         except KeyboardInterrupt:
             print("\n用户中断")
