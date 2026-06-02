@@ -22,6 +22,7 @@ from sqlalchemy import func, or_, text
 
 import jd_analyzer as _jd_mod  # 注册 JDAnalysis 到 Base.metadata（必须在 _init_db 前导入）
 from jd_analyzer import JDAnalysis, JDAnalyzer
+from job_matcher import find_matching_jobs, CITY_CODES
 from liepin_recruitment_spider import (
     COMPANIES,
     DATABASE_URL,
@@ -137,12 +138,33 @@ class AnalyzeStatus(BaseModel):
     error: Optional[str] = None
 
 
+# ── 求职匹配 ──────────────────────────────────────────────────────────────────
+
+class MatchRequest(BaseModel):
+    resume: str                          # 简历纯文本
+    city: str                            # 目标城市，如"北京"
+    keywords: Optional[list[str]] = None # 手动搜索词，None 则 AI 自动提取
+    top_n: int = 20                      # 返回 Top N
+    max_pages: int = 2                   # 每个关键词最多爬几页
+    fetch_detail: bool = False           # 是否进入详情页抓 JD 全文
+    intern_mode: bool = False            # 校招/实习模式
+    api_key: Optional[str] = None        # DeepSeek API Key，不传读环境变量
+
+
+class MatchStatus(BaseModel):
+    task_id: str
+    status: str                          # pending / running / done / error
+    result: Optional[dict] = None        # find_matching_jobs 的返回值
+    error: Optional[str] = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── 后台任务状态（进程内，重启后清空） ────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 _scrape_tasks: dict[str, dict] = {}
 _analyze_tasks: dict[str, dict] = {}
+_match_tasks: dict[str, dict] = {}
 
 
 def _run_analyze(task_id: str, api_key: Optional[str], vendor: Optional[str], limit: Optional[int]):
@@ -170,6 +192,26 @@ def _run_scrape(task_id: str, incremental: bool, fetch_detail: bool, companies: 
             _scrape_tasks[task_id].update(status="done", inserted=spider.grand_total)
     except Exception as e:
         _scrape_tasks[task_id].update(status="error", error=str(e))
+
+
+def _run_match(task_id: str, req: MatchRequest):
+    _match_tasks[task_id]["status"] = "running"
+    try:
+        result = find_matching_jobs(
+            resume_text=req.resume,
+            city=req.city,
+            keywords=req.keywords,
+            top_n=req.top_n,
+            api_key=req.api_key,
+            max_pages_per_keyword=req.max_pages,
+            fetch_detail=req.fetch_detail,
+            headless=True,           # API 调用场景下始终无头
+            use_proxy=True,
+            intern_mode=req.intern_mode,
+        )
+        _match_tasks[task_id].update(status="done", result=result)
+    except Exception as e:
+        _match_tasks[task_id].update(status="error", error=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,3 +381,47 @@ def stats_skills(
 
     ranked = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:top_n]
     return [{"skill": s, "count": c} for s, c in ranked]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── 求职匹配端点 ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/match", response_model=MatchStatus, status_code=202, summary="根据简历触发求职匹配任务")
+def trigger_match(req: MatchRequest):
+    """
+    提交简历和目标城市，后台自动：
+    1. AI 解析简历，提取搜索关键词
+    2. 爬取猎聘对应城市的匹配职位
+    3. AI 为每个职位打匹配分并排序
+
+    用 GET /match/{task_id} 轮询任务状态，done 后 result 字段包含完整结果。
+    """
+    if req.city not in CITY_CODES:
+        # 允许非标城市，但给出提示（spider 会以无城市过滤模式运行）
+        pass
+
+    task_id = str(uuid.uuid4())
+    _match_tasks[task_id] = {"status": "pending", "result": None, "error": None}
+
+    threading.Thread(
+        target=_run_match,
+        args=(task_id, req),
+        daemon=True,
+    ).start()
+
+    return MatchStatus(task_id=task_id, status="pending")
+
+
+@app.get("/match/{task_id}", response_model=MatchStatus, summary="查询求职匹配任务状态")
+def get_match_status(task_id: str):
+    task = _match_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return MatchStatus(task_id=task_id, **task)
+
+
+@app.get("/cities", summary="支持的城市列表")
+def list_cities():
+    """返回支持精确城市过滤的城市名列表。"""
+    return list(CITY_CODES.keys())
