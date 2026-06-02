@@ -20,6 +20,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, or_, text
 
+import jd_analyzer as _jd_mod  # 注册 JDAnalysis 到 Base.metadata（必须在 _init_db 前导入）
+from jd_analyzer import JDAnalysis, JDAnalyzer
 from liepin_recruitment_spider import (
     COMPANIES,
     DATABASE_URL,
@@ -110,11 +112,47 @@ class ScrapeStatus(BaseModel):
     error: Optional[str] = None
 
 
+class AnalysisOut(BaseModel):
+    id: uuid.UUID
+    job_id: uuid.UUID
+    job_function: Optional[str] = None
+    seniority: Optional[str] = None
+    skills: Optional[list[str]] = None
+    summary: Optional[str] = None
+    analyzed_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+class AnalyzeRequest(BaseModel):
+    api_key: Optional[str] = None   # 不传则读环境变量 DEEPSEEK_API_KEY
+    vendor: Optional[str] = None    # None = 全部公司
+    limit: Optional[int] = None     # None = 全部未分析岗位
+
+
+class AnalyzeStatus(BaseModel):
+    task_id: str
+    status: str                      # pending / running / done / error
+    analyzed: Optional[int] = None
+    error: Optional[str] = None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── 后台任务状态（进程内，重启后清空） ────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 _scrape_tasks: dict[str, dict] = {}
+_analyze_tasks: dict[str, dict] = {}
+
+
+def _run_analyze(task_id: str, api_key: Optional[str], vendor: Optional[str], limit: Optional[int]):
+    _analyze_tasks[task_id]["status"] = "running"
+    try:
+        analyzer = JDAnalyzer(api_key=api_key)
+        n = analyzer.run_batch(limit=limit, vendor=vendor)
+        _analyze_tasks[task_id].update(status="done", analyzed=n)
+    except Exception as e:
+        _analyze_tasks[task_id].update(status="error", error=str(e))
 
 
 def _run_scrape(task_id: str, incremental: bool, fetch_detail: bool, companies: list):
@@ -241,3 +279,63 @@ def get_scrape_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     return ScrapeStatus(task_id=task_id, **task)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── JD 分析端点 ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/jobs/{job_id}/analysis", response_model=AnalysisOut, summary="获取岗位的 AI 分析结果")
+def get_job_analysis(job_id: uuid.UUID):
+    with get_db() as db:
+        record = db.query(JDAnalysis).filter_by(job_id=job_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="该岗位暂无分析结果")
+        return record
+
+
+@app.post("/analyze", response_model=AnalyzeStatus, status_code=202, summary="触发 JD 批量分析任务")
+def trigger_analyze(req: AnalyzeRequest):
+    task_id = str(uuid.uuid4())
+    _analyze_tasks[task_id] = {"status": "pending", "analyzed": None, "error": None}
+
+    threading.Thread(
+        target=_run_analyze,
+        args=(task_id, req.api_key, req.vendor, req.limit),
+        daemon=True,
+    ).start()
+
+    return AnalyzeStatus(task_id=task_id, status="pending")
+
+
+@app.get("/analyze/{task_id}", response_model=AnalyzeStatus, summary="查询分析任务状态")
+def get_analyze_status(task_id: str):
+    task = _analyze_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return AnalyzeStatus(task_id=task_id, **task)
+
+
+@app.get("/stats/skills", summary="全量技能词频统计")
+def stats_skills(
+    vendor: Optional[str] = Query(None, description="按公司过滤"),
+    top_n:  int           = Query(20, ge=1, le=100, description="返回前 N 个技能"),
+):
+    with get_db() as db:
+        query = db.query(JDAnalysis)
+        if vendor:
+            job_ids = [
+                r.id for r in db.query(CompetitorRecruitment.id)
+                .filter(CompetitorRecruitment.vendor == vendor)
+                .all()
+            ]
+            query = query.filter(JDAnalysis.job_id.in_(job_ids))
+        records = query.filter(JDAnalysis.skills.isnot(None)).all()
+
+    counter: dict[str, int] = {}
+    for r in records:
+        for skill in (r.skills or []):
+            counter[skill] = counter.get(skill, 0) + 1
+
+    ranked = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    return [{"skill": s, "count": c} for s, c in ranked]
